@@ -121,19 +121,29 @@ $ git ls-files -z | xargs -0 cat | pixi-mask scan --json | jq '.findings | lengt
 
 ## Wiring it into an agent
 
-Anything that can pipe text can use it. For
-[Pixi](https://github.com/Panoplos/Pixi) / [pi](https://github.com/earendil-works/pi),
-the bundled extension
-[`key-guard.ts`](https://github.com/Panoplos/Pixi/blob/main/packages/coding-agent/examples/extensions/key-guard.ts)
-runs it on every tool result and every user message:
+Anything that can pipe text can use it: `pixi-mask mask` reads stdin and writes
+masked text to stdout.
 
-1. `pixi-mask mask --json` on the text, 5 ms
-2. use the returned `text` in place of the original
-3. notify once if `findings` is not empty
+For [Pixi](https://github.com/Panoplos/Pixi) / [pi](https://github.com/earendil-works/pi)
+there is a ready-made hook,
+[`key-guard.ts`](https://github.com/Panoplos/Pixi/blob/main/packages/coding-agent/examples/extensions/key-guard.ts).
+It masks every tool result and every user message before either reaches the
+model:
+
+```console
+$ curl -o ~/.pi/agent/extensions/key-guard.ts \
+    https://raw.githubusercontent.com/Panoplos/Pixi/main/packages/coding-agent/examples/extensions/key-guard.ts
+```
+
+On each hook call it runs `pixi-mask mask --json` (~5 ms), puts the returned
+`text` in place of the original, and warns once per session when `findings` is
+not empty. A tool result that was fully masked still reaches the model, so the
+model sees `sk-p…[REDACTED]` and can reason about it, but not the key.
 
 The hook keeps an in-process fallback for machines without the binary, so a
 missing `pixi-mask` degrades instead of breaking the session. Set
-`PIXI_MASK_BIN` to point at a non-standard build.
+`PIXI_MASK_BIN` to point at a non-standard build. `/reload` re-reads the file;
+keys rotated in `auth.json` are picked up on the next process start.
 
 ## What it knows
 
