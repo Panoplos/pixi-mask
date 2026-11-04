@@ -88,17 +88,29 @@ keys with no prefix, and both are listed under Known limits.
 
 Whole binary, process start included, on an M-series Mac:
 
-| input | pixi-mask | gitleaks 8.30 |
-|---|---|---|
-| 2 KB tool result | 5 ms | — |
-| 20 KB tool result | 7 ms | — |
-| 47 KB prose (no keywords) | 9 ms | — |
-| 108 KB TypeScript | **12 ms** | 57 ms |
-| 155 KB mixed | 14 ms | 77 ms |
+| input | pixi-mask | gitleaks 8.30 | betterleaks 2.0.0-rc.6 |
+|---|---|---|---|
+| 2 KB tool result | 5 ms | — | 48 ms |
+| 20 KB tool result | 7 ms | — | 68 ms |
+| 47 KB prose (no keywords) | **9 ms** | — | 48 ms |
+| 108 KB TypeScript | **12 ms** | 57 ms | 70 ms |
+| 155 KB mixed | **14 ms** | 77 ms | 74 ms |
 
 About 2 ms of every run is process start (`/usr/bin/true` costs 1.7 ms here).
 The betterleaks refresh costs ~1 ms per 47 KB against the previous 220-rule
 set.
+
+betterleaks has a fixed floor of ~35 ms (a 6-byte file costs that): it compiles
+all 474 rules and their Expr filter programs at startup, before reading a byte.
+pixi-mask's rules are already Rust and compile lazily, only for the rules whose
+keywords appear. That floor is why betterleaks costs the same on 2 KB as on
+47 KB, and it is the whole difference on files this small.
+
+Above roughly 50 KB the per-byte gap shows too: 35 ms of scanning on 108 KB
+against 10 ms here, about 3x. On a directory betterleaks still wins outright
+(3.3 MB over 401 files in 15 ms) because it fans out over cores, while pixi-mask
+is one process per file. That is the shape this tool is not built for: the hook
+runs it on one tool result at a time.
 
 Regex is linear-time, so a hostile tool result cannot blow it up. The worst
 case is linear; gitleaks' own fast rules still show 145 ms spikes on 20 KB of
