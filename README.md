@@ -211,9 +211,9 @@ python3 tools/gen-rules.py          # regenerate
 python3 tools/gen-rules.py --check  # fail if src/rules.rs is stale
 ```
 
-452 of its 474 rules survive the translation. Dropped: five path-only rules,
-`pkcs12-file`, the three generic rules (replaced in `src/extra.rs`) and the 18
-`*-client-id` rules. Each rule's Expr filter is reduced to its entropy floor
+452 of its 474 rules survive the translation. Dropped: `pkcs12-file` (a path
+rule with no pattern to match), the three generic rules (replaced in
+`src/extra.rs`) and the 18 `*-client-id` rules. Each rule's Expr filter is reduced to its entropy floor
 plus allowlist regexes — `matchesAny`/`containsAny`/`startsWithAny` calls on
 `finding["secret"]`, which is what an allowlist is — and everything else in
 the expression is left out. Doubled braces in Go-oriented patterns are escaped
