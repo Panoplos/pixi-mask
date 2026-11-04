@@ -66,6 +66,19 @@ fn provider_shapes_are_masked() {
         ),
         ("npm", format!("npm_{}", tok(12, 36, alnum()))),
         ("gitlab", format!("glpat-{}", tok(13, 20, alnum()))),
+        ("vercel", format!("vercel_token={}", tok(25, 24, alnum()))),
+        (
+            "openrouter",
+            format!("sk-or-v1-{}", tok(26, 64, b"0123456789abcdef")),
+        ),
+        (
+            "tailscale",
+            format!(
+                "tskey-auth-k{}CNTRL-{}",
+                tok(27, 8, alnum()),
+                tok(28, 32, alnum())
+            ),
+        ),
         // Providers gitleaks has no rule for.
         ("huggingface", format!("hf_{}", tok(14, 34, alnum()))),
         ("groq", format!("gsk_{}", tok(15, 52, alnum()))),
@@ -179,6 +192,12 @@ fn benign_content_is_untouched() {
         (
             "shard-ids",
             "shard-a1b2c3d4e5f6 worker-7f3c9a2b\n".to_string(),
+        ),
+        // A public OAuth client id is not a secret, and masking it removes a
+        // constant the agent may need to read.
+        (
+            "public-client-id",
+            "const CLIENT_ID = \"17e5f671-d194-4dfb-9706-5516cb48c098\";\n".to_string(),
         ),
     ];
     for (label, text) in cases {

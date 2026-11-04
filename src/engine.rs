@@ -1,13 +1,14 @@
 // Detection engine: keyword prefilter -> rule regexes -> entropy -> allowlists,
 // plus exact known values, a bare high-entropy rule, and a base64 decode pass.
 //
-// Same shape as gitleaks (regex + keywords + entropy), with two differences
+// Same shape as betterleaks (regex + keywords + entropy), with two differences
 // that matter for a context guard: path-based skips are gone (we scan text),
-// and matches are masked in place instead of reported.
+// and matches are masked in place instead of reported. Expr filters are
+// reduced to an entropy floor plus allowlist regexes at generation time.
 //
-// Regexes are compiled ASCII-only (`unicode(false)`). That is what RE2 does for
-// gitleaks, and it keeps the whole 221-rule set under ~10 ms to compile instead
-// of ~1 s: unicode `\w` expands into huge character classes.
+// Regexes are compiled ASCII-only (`unicode(false)`). That is what RE2 does in
+// both upstream scanners, and it keeps the whole 452-rule set under ~30 ms to
+// compile instead of ~1 s: unicode `\w` expands into huge character classes.
 
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
@@ -162,12 +163,18 @@ impl Scanner {
         }
     }
 
-    /// Compile every rule. Returns `(rule id, error)` for the ones that fail.
+    /// Compile every rule and allowlist. Returns `(rule id, error)` for the
+    /// ones that fail: a rule that does not compile is a hole in coverage.
     pub fn verify(&self) -> Vec<(String, String)> {
         let mut failures = Vec::new();
         for (i, r) in self.all.iter().enumerate() {
             if let Err(e) = self.compiled(i) {
                 failures.push((r.id.to_string(), e));
+            }
+            for a in r.allow {
+                if let Err(e) = bytes_regex_checked(a.regex) {
+                    failures.push((r.id.to_string(), format!("allowlist: {e}")));
+                }
             }
         }
         failures
