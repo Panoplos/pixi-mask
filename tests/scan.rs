@@ -315,6 +315,58 @@ fn decode_depth_is_a_parameter() {
     assert_eq!(deep[0].rule, "base64");
 }
 
+/// Five nested percent encodings of one assignment: 11421 bytes, past the
+/// default cap, so the default scan reports it unread and the rule never runs;
+/// with the cap raised it decodes all five layers inside the context.
+#[test]
+fn an_oversized_run_is_reported_and_a_larger_cap_reads_it() {
+    let mut layer = format!("OPENAI_API_KEY=sk-proj-{}", tok(86, 24, alnum()));
+    for _ in 0..5 {
+        layer = percent_all(&layer);
+    }
+    assert!(layer.len() > 8000, "fixture is {} bytes", layer.len());
+    let text = format!("payload {layer}\n");
+
+    let default = configured(true, false, 5).report(&text);
+    assert!(default.spans.is_empty(), "spans: {:?}", default.spans);
+    assert_eq!(default.skipped.len(), 1, "skipped: {:?}", default.skipped);
+    assert_eq!(default.skipped[0].rule, "percent");
+    assert_eq!(default.skipped[0].len(), layer.len());
+    assert!(default.complete);
+
+    let mut config = Config::new(Vec::new());
+    config.bare_entropy = false;
+    config.depth = 5;
+    config.max_decode_run = 64 * 1024;
+    let report = Scanner::with_config(config).report(&text);
+    assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+    assert_eq!(report.spans.len(), 1, "spans: {:?}", report.spans);
+    assert_eq!(report.spans[0].rule, "percent");
+    assert!(report.complete);
+}
+
+/// The percent pattern also matches plain paths; a long run with no `%XX`
+/// escape is not an unread encoded segment and must not be refused as one.
+#[test]
+fn a_long_plain_run_is_not_reported_as_an_unread_encoded_segment() {
+    let text = format!("https://example.com/{}", "a/".repeat(4500));
+    let report = configured(true, false, 2).report(&text);
+    assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+    assert!(report.complete);
+}
+
+/// More decodable segments than the decode budget leaves the tail unread; the
+/// report says so instead of looking like a clean scan.
+#[test]
+fn a_spent_decode_budget_is_reported_incomplete() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let block = STANDARD.encode(format!("OPENAI_API_KEY=sk-proj-{}", tok(87, 20, alnum())));
+    let text = format!("{block}\n").repeat(5000);
+    let report = configured(true, false, 2).report(&text);
+    assert!(!report.complete, "5000 segments did not exceed the budget");
+}
+
 /// base64 of ordinary prose and a detached private-key body are the two false
 /// refusals the keyword-free rule causes; both are off in this configuration.
 #[test]

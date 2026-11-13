@@ -31,12 +31,16 @@ const SIZE_LIMIT: usize = 64 * 1024 * 1024;
 // secrets are still caught by keyword rules.
 const MAX_BARE_RUN: usize = 80;
 
-// Longest encoded run worth trying to decode.
+// Longest encoded run the decoder reads when the caller does not say.
 const MAX_ENCODED_RUN: usize = 8000;
 
 // Bytes of original text kept on each side of a decoded segment, so keyword
 // rules see the assignment name and line-scoped allowlists see the line.
 const DECODE_CONTEXT: usize = 512;
+
+// Bytes of an over-cap run the decoder probes to decide whether the run is a
+// skipped decode or just a long string that happens to match the pattern.
+const MAX_DECODE_PROBE: usize = 4096;
 
 // Decode attempts allowed per scan. Nested payloads multiply, and a hostile
 // input must not turn depth 5 into a quadratic walk.
@@ -91,6 +95,10 @@ pub struct Config {
     pub bare_entropy: bool,
     pub decode: Decode,
     pub depth: usize,
+    /// Longest encoded run the decoder reads, in bytes. A longer run is left
+    /// undecoded and listed in [`Report::skipped`], so a caller that refuses
+    /// files can refuse on it instead of detecting encoded runs itself.
+    pub max_decode_run: usize,
 }
 
 impl Config {
@@ -102,6 +110,7 @@ impl Config {
             bare_entropy: true,
             decode: Decode::ALL,
             depth: 2,
+            max_decode_run: MAX_ENCODED_RUN,
         }
     }
 }
@@ -115,6 +124,7 @@ pub struct Scanner {
     bare_entropy: bool,
     decode: Decode,
     depth: usize,
+    max_decode_run: usize,
     keyword_ac: Option<AhoCorasick>,
     keyword_rules: Vec<Vec<usize>>,
     unconditional: Vec<usize>,
@@ -144,6 +154,21 @@ impl Span {
     }
 }
 
+/// What a scan found, and what it declined to read.
+#[derive(Debug)]
+pub struct Report {
+    pub spans: Vec<Span>,
+    /// Encoded runs left undecoded because they are longer than
+    /// [`Config::max_decode_run`], as spans in the scanned bytes. A nested
+    /// payload reports the outer run, the one present in the input. Overlapping
+    /// entries are merged, so the rule names one of the codecs that declined.
+    pub skipped: Vec<Span>,
+    /// False when the decode budget ran out before the input ended: the rest of
+    /// the input was not decoded. A caller that cannot admit unscanned text
+    /// treats it as a refusal.
+    pub complete: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Codec {
     Base64,
@@ -160,6 +185,21 @@ impl Codec {
             Codec::Hex => "hex",
             Codec::Percent => "percent",
         }
+    }
+
+    /// Whether this codec would have decoded the run had it been short enough.
+    /// The three patterns match more than their decoders accept (a URL path
+    /// matches the base64 shape but decodes to binary), so the first 4 KiB,
+    /// aligned to the codec's quantum, has to decode to printable text.
+    /// Probing rather than decoding whole keeps a 64 MiB asset cheap.
+    fn would_read(self, run: &[u8]) -> bool {
+        let quantum = match self {
+            Codec::Base64 => 4,
+            Codec::Hex => 2,
+            Codec::Percent => 1,
+        };
+        let take = (run.len().min(MAX_DECODE_PROBE) / quantum) * quantum;
+        take > 0 && decode_run(self, &run[..take]).is_some()
     }
 }
 
@@ -262,6 +302,7 @@ impl Scanner {
             bare_entropy: config.bare_entropy,
             decode: config.decode,
             depth: config.depth,
+            max_decode_run: config.max_decode_run,
             keyword_ac,
             keyword_rules,
             unconditional,
@@ -432,16 +473,30 @@ impl Scanner {
 
     /// Scan UTF-8 text. Spans land on char boundaries, so [`mask`] can slice.
     pub fn scan(&self, text: &str) -> Vec<Span> {
-        self.scan_impl(text.as_bytes(), Some(text))
+        self.report(text).spans
     }
 
     /// Scan bytes, for callers that hold a file or a pipe rather than a `str`.
     pub fn scan_bytes(&self, hay: &[u8]) -> Vec<Span> {
+        self.report_bytes(hay).spans
+    }
+
+    /// Like [`Scanner::scan`], and also says what the decoder did not read.
+    pub fn report(&self, text: &str) -> Report {
+        self.scan_impl(text.as_bytes(), Some(text))
+    }
+
+    /// Like [`Scanner::scan_bytes`], and also says what the decoder did not
+    /// read: oversized runs in [`Report::skipped`], a spent budget in
+    /// [`Report::complete`].
+    pub fn report_bytes(&self, hay: &[u8]) -> Report {
         self.scan_impl(hay, None)
     }
 
-    fn scan_impl(&self, hay: &[u8], text: Option<&str>) -> Vec<Span> {
+    fn scan_impl(&self, hay: &[u8], text: Option<&str>) -> Report {
         let mut spans: Vec<Span> = Vec::new();
+        let mut skipped: Vec<Span> = Vec::new();
+        let mut complete = true;
 
         if let Some(ac) = &self.known_ac {
             for m in ac.find_iter(hay) {
@@ -493,14 +548,36 @@ impl Scanner {
                     continue;
                 }
                 for m in self.codec_regex(codec).find_iter(hay) {
-                    if m.len() > MAX_ENCODED_RUN {
+                    if m.len() > self.max_decode_run {
+                        if codec.would_read(m.as_bytes()) {
+                            skipped.push(Span {
+                                start: m.start(),
+                                end: m.end(),
+                                rule: codec.rule(),
+                            });
+                        }
                         continue;
                     }
                     let Some(decoded) = decode_run(codec, m.as_bytes()) else {
                         continue;
                     };
-                    if self.decoded_hit(hay, m.start(), m.end(), &decoded, self.depth, &mut budget)
-                    {
+                    let mut too_long = false;
+                    let hit = self.decoded_hit(
+                        hay,
+                        m.start()..m.end(),
+                        &decoded,
+                        self.depth,
+                        &mut budget,
+                        &mut too_long,
+                    );
+                    if too_long {
+                        skipped.push(Span {
+                            start: m.start(),
+                            end: m.end(),
+                            rule: codec.rule(),
+                        });
+                    }
+                    if hit {
                         spans.push(Span {
                             start: m.start(),
                             end: m.end(),
@@ -508,15 +585,21 @@ impl Scanner {
                         });
                     }
                     if budget == 0 {
+                        complete = false;
                         break 'codecs;
                     }
                 }
             }
         }
 
-        match text {
+        let spans = match text {
             Some(t) => merge(t, spans),
             None => merge_bytes(spans),
+        };
+        Report {
+            spans,
+            skipped: merge_bytes(skipped),
+            complete,
         }
     }
 
@@ -535,12 +618,13 @@ impl Scanner {
     fn decoded_hit(
         &self,
         hay: &[u8],
-        start: usize,
-        end: usize,
+        run: std::ops::Range<usize>,
         decoded: &[u8],
         depth: usize,
         budget: &mut usize,
+        too_long: &mut bool,
     ) -> bool {
+        let (start, end) = (run.start, run.end);
         if depth == 0 || *budget == 0 {
             return false;
         }
@@ -567,13 +651,21 @@ impl Scanner {
                 continue;
             }
             for m in self.codec_regex(codec).find_iter(decoded) {
-                if m.len() > MAX_ENCODED_RUN {
+                if m.len() > self.max_decode_run {
+                    *too_long |= codec.would_read(m.as_bytes());
                     continue;
                 }
                 let Some(inner) = decode_run(codec, m.as_bytes()) else {
                     continue;
                 };
-                if self.decoded_hit(decoded, m.start(), m.end(), &inner, depth - 1, budget) {
+                if self.decoded_hit(
+                    decoded,
+                    m.start()..m.end(),
+                    &inner,
+                    depth - 1,
+                    budget,
+                    too_long,
+                ) {
                     return true;
                 }
                 if *budget == 0 {

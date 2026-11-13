@@ -63,7 +63,9 @@ changes that matter for inline use:
 - **Encoded segments.** base64, hex and percent runs are decoded and rescanned
   with the decoded bytes substituted for the run, so a keyword rule still sees
   `API_KEY=` in front of the value. The depth is the caller's, two rounds by
-  default, as in gitleaks' decoder.
+  default, as in gitleaks' decoder. A run longer than the size cap is left
+  undecoded; `Scanner::report` lists it, so a caller that must not admit
+  unscanned text refuses on that fact instead of re-detecting runs itself.
 
 Measured on 49 realistic provider samples and 3.3 MB of a real repository:
 
@@ -122,7 +124,7 @@ junk.
 ## Install
 
 ```bash
-cargo install --git https://github.com/Panoplos/pixi-mask --tag v0.2.0
+cargo install --git https://github.com/Panoplos/pixi-mask --tag v0.3.0
 # or from a checkout:
 cargo build --release && ln -sf "$PWD/target/release/pixi-mask" ~/.local/bin/pixi-mask
 ```
@@ -130,7 +132,7 @@ cargo build --release && ln -sf "$PWD/target/release/pixi-mask" ~/.local/bin/pix
 As a dependency:
 
 ```toml
-pixi-mask = { git = "https://github.com/Panoplos/pixi-mask", tag = "v0.2.0" }
+pixi-mask = { git = "https://github.com/Panoplos/pixi-mask", tag = "v0.3.0" }
 ```
 
 ## Usage
@@ -141,9 +143,10 @@ pixi-mask scan [options]     stdin -> findings; exit 1 if any
 pixi-mask rules [--verify]   list rule ids; --verify compiles every rule
 
 Options
-  --json                 machine-readable output (mask: {text, findings})
+  --json                 machine-readable output (mask: {text, findings, skipped, complete})
   -q, --quiet            no findings line on stderr
   --decode-depth <n>     decode rounds over encoded runs (default 2, 0 disables)
+  --max-decode-run <n>   longest encoded run to decode, in bytes (default 8000)
   --no-extra             vendored betterleaks rules only
   --no-bare              drop the keyword-free 20-80 byte high-entropy rule
   --no-known             skip exact values from auth.json, .env, ...
@@ -155,8 +158,14 @@ Options
 a hook wants:
 
 ```json
-{"text": "OPENAI_API_KEY=d2a1…[REDACTED]", "findings": [{"rule": "assignment-secret", "line": 1, "start": 15, "len": 48}]}
+{"text": "OPENAI_API_KEY=d2a1…[REDACTED]", "findings": [{"rule": "assignment-secret", "line": 1, "start": 15, "len": 48}], "skipped": [], "complete": true}
 ```
+
+An empty `skipped` and a true `complete` always mean every encoded run in the
+input was decoded. `skipped` lists runs left undecoded because they exceed the
+size cap, and `complete` is false when the decode budget (4096 segments) ran
+out first. Either one means the output may still hold a secret; both are also
+printed on stderr unless `--quiet`.
 
 `scan` is the same engine with exit codes, for CI and for checking a file
 before you decide to gate it:
@@ -180,11 +189,22 @@ let mut config = Config::new(Vec::new());
 config.extra = false;        // vendored betterleaks rules only
 config.bare_entropy = false; // no keyword-free heuristic
 config.depth = 5;            // decode rounds over encoded segments
+config.max_decode_run = 64 * 1024; // raise the size cap for this caller
 let scanner = Scanner::checked(config).expect("every rule compiles");
-for span in scanner.scan_bytes(&bytes) {
+let report = scanner.report_bytes(&bytes);
+for span in &report.spans {
     println!("{} {}..{}", span.rule, span.start, span.end);
 }
+// ADMISSION: refuse when the scanner did not read the whole file.
+if !report.skipped.is_empty() || !report.complete {
+    // report.skipped: runs over the cap, at any nesting depth (outer run).
+}
 ```
+
+`Scanner::scan` and `scan_bytes` return the spans alone. `report` and
+`report_bytes` also return `skipped` (oversized runs, as spans in the scanned
+bytes) and `complete`; a caller that refuses files should check both rather
+than compare run lengths against the cap itself.
 
 `Scanner::new` compiles rule regexes lazily and skips a rule that fails to
 compile; `Scanner::checked` compiles all of them up front and returns the
@@ -243,8 +263,10 @@ Beyond the vendored rules:
 - Bare runs longer than 80 bytes are skipped whole rather than masked in
   fragments, so inline base64 assets and npm `integrity` digests stay readable.
 - A decoded segment is rescanned only when it is at least 90% printable ASCII,
-  and only when the run is 8000 bytes or shorter; a scan stops decoding after
-  4096 segments.
+  and only when the run is `Config::max_decode_run` bytes or shorter (8000 by
+  default); a scan stops decoding after 4096 segments. Both bounds are
+  observable: `Scanner::report` lists the runs over the cap and sets
+  `complete: false` when the budget ran out.
 - Path-only rules are not carried. `pkcs12-file` is the only one, so a `.p12`
   or `.pfx` has to be refused by name or by magic bytes in the caller. A text
   scanner cannot see a path.

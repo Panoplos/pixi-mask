@@ -28,6 +28,28 @@
 //! that needs to know uses [`Scanner::checked`] (or `verify`) at start-up and
 //! refuses to run when it returns an error.
 //!
+//! # Decoding bounds
+//!
+//! An encoded run longer than [`Config::max_decode_run`] (8000 bytes by default)
+//! is not decoded. [`Scanner::report`] and [`Scanner::report_bytes`] return the
+//! spans of those runs in [`Report::skipped`], and set [`Report::complete`] to
+//! false when the decode budget ran out. A caller that must not admit unscanned
+//! text refuses on either, at any cap, instead of guessing at the cap itself.
+//!
+//! ```
+//! use pixi_mask::{Config, Scanner};
+//!
+//! let mut config = Config::new(Vec::new());
+//! config.extra = true;
+//! config.bare_entropy = false;
+//! config.depth = 5;
+//! config.max_decode_run = 64 * 1024;
+//! let scanner = Scanner::checked(config).expect("every rule compiles");
+//! let report = scanner.report_bytes(b"OPENAI_API_KEY=sk-proj-Ab3dEf6hIj9lMn2pQr5tUv8x");
+//! assert_eq!(report.spans.len(), 1);
+//! assert!(report.skipped.is_empty() && report.complete);
+//! ```
+//!
 //! [`known`]: crate::known
 
 pub mod engine;
@@ -35,7 +57,7 @@ pub mod extra;
 pub mod known;
 pub mod rules;
 
-pub use engine::{Config, Decode, Scanner, Span};
+pub use engine::{Config, Decode, Report, Scanner, Span};
 
 /// Identity of the rule set a build carries, for a decision record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

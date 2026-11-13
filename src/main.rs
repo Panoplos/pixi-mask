@@ -16,6 +16,7 @@ Options:
   --json                 machine-readable output (mask: {text, findings})
   -q, --quiet            no findings line on stderr
   --decode-depth <n>     decode base64/hex/percent runs up to n rounds (default 2)
+  --max-decode-run <n>   longest encoded run to decode, in bytes (default 8000)
   --no-extra             vendored betterleaks rules only (drops assignment-*)
   --no-bare              drop the keyword-free 20-80 byte high-entropy rule
   --no-known             skip exact values from auth.json, .env, ...
@@ -23,6 +24,8 @@ Options:
   --known <value>        add one known value (repeatable)
   -h, --help             this text
   -V, --version          version
+
+Exit: 0 clean, 1 findings, 2 usage or input error.
 
 Env: PIXI_MASK_KNOWN — colon-separated known-value files
      PI_CODING_AGENT_DIR — where auth.json lives (default ~/.pi/agent)
@@ -53,6 +56,7 @@ fn main() -> ExitCode {
     let mut known_inline: Vec<String> = Vec::new();
     let mut verify = false;
     let mut depth: Option<usize> = None;
+    let mut max_decode_run: Option<usize> = None;
     let mut extra_rules = true;
     let mut bare_entropy = true;
 
@@ -70,6 +74,13 @@ fn main() -> ExitCode {
                 match argv.get(i).and_then(|v| v.parse::<usize>().ok()) {
                     Some(n) => depth = Some(n),
                     None => return fail("--decode-depth needs a number"),
+                }
+            }
+            "--max-decode-run" => {
+                i += 1;
+                match argv.get(i).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) => max_decode_run = Some(n),
+                    None => return fail("--max-decode-run needs a number"),
                 }
             }
             "--known-file" => {
@@ -125,12 +136,15 @@ fn main() -> ExitCode {
             if let Some(d) = depth {
                 config.depth = d;
             }
-            let scanner = engine::Scanner::with_config(config);
-            let spans = scanner.scan(&text);
-            if cmd == "scan" {
-                return run_scan(&text, &spans, json, quiet);
+            if let Some(n) = max_decode_run {
+                config.max_decode_run = n;
             }
-            run_mask(&text, &spans, &scanner, json, quiet)
+            let scanner = engine::Scanner::with_config(config);
+            let report = scanner.report(&text);
+            if cmd == "scan" {
+                return run_scan(&text, &report, json, quiet);
+            }
+            run_mask(&text, &report, json, quiet)
         }
         other => fail(&format!("unknown command: {other}")),
     }
@@ -142,28 +156,17 @@ fn read_stdin() -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn run_mask(
-    text: &str,
-    spans: &[engine::Span],
-    _scanner: &engine::Scanner,
-    json: bool,
-    quiet: bool,
-) -> ExitCode {
+fn run_mask(text: &str, report: &engine::Report, json: bool, quiet: bool) -> ExitCode {
+    let spans = &report.spans;
     let masked = engine::mask(text, spans);
     let mut out = std::io::stdout().lock();
     if json {
-        let findings: Vec<serde_json::Value> = spans
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "rule": s.rule,
-                    "line": engine::line_of(text, s.start),
-                    "start": s.start,
-                    "len": s.len(),
-                })
-            })
-            .collect();
-        let payload = serde_json::json!({ "text": masked, "findings": findings });
+        let payload = serde_json::json!({
+            "text": masked,
+            "findings": findings_json(text, spans),
+            "skipped": findings_json(text, &report.skipped),
+            "complete": report.complete,
+        });
         let _ = writeln!(out, "{payload}");
         return ExitCode::SUCCESS;
     }
@@ -183,23 +186,19 @@ fn run_mask(
             rules.join(", ")
         );
     }
+    warn_unscanned(text, report, quiet);
     ExitCode::SUCCESS
 }
 
-fn run_scan(text: &str, spans: &[engine::Span], json: bool, quiet: bool) -> ExitCode {
+fn run_scan(text: &str, report: &engine::Report, json: bool, quiet: bool) -> ExitCode {
+    let spans = &report.spans;
     if json {
-        let findings: Vec<serde_json::Value> = spans
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "rule": s.rule,
-                    "line": engine::line_of(text, s.start),
-                    "start": s.start,
-                    "len": s.len(),
-                })
-            })
-            .collect();
-        println!("{}", serde_json::json!({ "findings": findings }));
+        let payload = serde_json::json!({
+            "findings": findings_json(text, spans),
+            "skipped": findings_json(text, &report.skipped),
+            "complete": report.complete,
+        });
+        println!("{payload}");
     } else if !quiet {
         for s in spans {
             eprintln!(
@@ -209,11 +208,49 @@ fn run_scan(text: &str, spans: &[engine::Span], json: bool, quiet: bool) -> Exit
                 s.len()
             );
         }
+        warn_unscanned(text, report, false);
     }
     if spans.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+fn findings_json(text: &str, spans: &[engine::Span]) -> Vec<serde_json::Value> {
+    spans
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "rule": s.rule,
+                "line": engine::line_of(text, s.start),
+                "start": s.start,
+                "len": s.len(),
+            })
+        })
+        .collect()
+}
+
+/// Say what the decoder did not read: a caller that logs the output must know
+/// the text it receives may still hold a secret.
+fn warn_unscanned(text: &str, report: &engine::Report, quiet: bool) {
+    if quiet {
+        return;
+    }
+    if !report.skipped.is_empty() {
+        let lines: Vec<String> = report
+            .skipped
+            .iter()
+            .map(|s| engine::line_of(text, s.start).to_string())
+            .collect();
+        eprintln!(
+            "pixi-mask: {} encoded run(s) not decoded (over the size cap): line {}",
+            report.skipped.len(),
+            lines.join(", ")
+        );
+    }
+    if !report.complete {
+        eprintln!("pixi-mask: decode budget exhausted; the rest of the input was not decoded");
     }
 }
 
