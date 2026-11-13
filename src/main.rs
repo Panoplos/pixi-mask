@@ -2,7 +2,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use pixi_mask::{engine, extra, known, rules};
+use pixi_mask::{engine, extra, known, rules, Config};
 
 const USAGE: &str = "\
 pixi-mask — mask secrets in text before it reaches a model context
@@ -15,6 +15,9 @@ Usage:
 Options:
   --json                 machine-readable output (mask: {text, findings})
   -q, --quiet            no findings line on stderr
+  --decode-depth <n>     decode base64/hex/percent runs up to n rounds (default 2)
+  --no-extra             vendored betterleaks rules only (drops assignment-*)
+  --no-bare              drop the keyword-free 20-80 byte high-entropy rule
   --no-known             skip exact values from auth.json, .env, ...
   --known-file <path>    add a file of known values (repeatable)
   --known <value>        add one known value (repeatable)
@@ -49,6 +52,9 @@ fn main() -> ExitCode {
     let mut known_files: Vec<PathBuf> = Vec::new();
     let mut known_inline: Vec<String> = Vec::new();
     let mut verify = false;
+    let mut depth: Option<usize> = None;
+    let mut extra_rules = true;
+    let mut bare_entropy = true;
 
     let mut i = 1;
     while i < argv.len() {
@@ -57,6 +63,15 @@ fn main() -> ExitCode {
             "-q" | "--quiet" => quiet = true,
             "--no-known" => no_known = true,
             "--verify" => verify = true,
+            "--no-extra" => extra_rules = false,
+            "--no-bare" => bare_entropy = false,
+            "--decode-depth" => {
+                i += 1;
+                match argv.get(i).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) => depth = Some(n),
+                    None => return fail("--decode-depth needs a number"),
+                }
+            }
             "--known-file" => {
                 i += 1;
                 match argv.get(i) {
@@ -104,7 +119,13 @@ fn main() -> ExitCode {
                 Ok(t) => t,
                 Err(e) => return fail(&format!("reading stdin: {e}")),
             };
-            let scanner = engine::Scanner::new(known);
+            let mut config = Config::new(known);
+            config.extra = extra_rules;
+            config.bare_entropy = bare_entropy;
+            if let Some(d) = depth {
+                config.depth = d;
+            }
+            let scanner = engine::Scanner::with_config(config);
             let spans = scanner.scan(&text);
             if cmd == "scan" {
                 return run_scan(&text, &spans, json, quiet);
@@ -207,7 +228,11 @@ fn run_rules(json: bool, verify: bool) -> ExitCode {
                 .collect();
             println!(
                 "{}",
-                serde_json::json!({ "rules": rules::RULES.len() + extra::EXTRA.len(), "failed": v })
+                serde_json::json!({
+                    "ruleset": ruleset_json(),
+                    "rules": rules::RULES.len() + extra::EXTRA.len(),
+                    "failed": v,
+                })
             );
         } else {
             for (id, e) in &failures {
@@ -231,13 +256,27 @@ fn run_rules(json: bool, verify: bool) -> ExitCode {
             .chain(extra::EXTRA.iter())
             .map(|r| r.id)
             .collect();
-        println!("{}", serde_json::json!({ "rules": ids }));
+        println!(
+            "{}",
+            serde_json::json!({ "ruleset": ruleset_json(), "rules": ids })
+        );
     } else {
         for r in rules::RULES.iter().chain(extra::EXTRA.iter()) {
             println!("{}", r.id);
         }
     }
     ExitCode::SUCCESS
+}
+
+fn ruleset_json() -> serde_json::Value {
+    let r = pixi_mask::RULESET;
+    serde_json::json!({
+        "name": r.name,
+        "version": r.version,
+        "sha256": r.sha256,
+        "rules": r.rules,
+        "extra": extra::EXTRA.len(),
+    })
 }
 
 fn fail(msg: &str) -> ExitCode {

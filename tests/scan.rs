@@ -1,6 +1,6 @@
 // Behaviour tests: values we must mask, values we must leave alone.
 
-use pixi_mask::engine::{self, Scanner};
+use pixi_mask::engine::{self, Config, Scanner};
 
 /// Deterministic filler so no test fixture looks like a real credential.
 fn tok(seed: u64, len: usize, alphabet: &[u8]) -> String {
@@ -23,6 +23,22 @@ fn alnum() -> &'static [u8] {
 
 fn scanner() -> Scanner {
     Scanner::new(Vec::new())
+}
+
+fn configured(extra: bool, bare_entropy: bool, depth: usize) -> Scanner {
+    let mut config = Config::new(Vec::new());
+    config.extra = extra;
+    config.bare_entropy = bare_entropy;
+    config.depth = depth;
+    Scanner::with_config(config)
+}
+
+fn hex_all(text: &str) -> String {
+    text.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+fn percent_all(text: &str) -> String {
+    text.bytes().map(|b| format!("%{b:02X}")).collect()
 }
 
 fn masked(text: &str) -> String {
@@ -242,4 +258,99 @@ fn entropy_basics() {
     assert!((engine::entropy(b"ab") - 1.0).abs() < 1e-9);
     let hex = tok(71, 64, b"0123456789abcdef");
     assert!(engine::entropy(hex.as_bytes()) <= 4.0);
+}
+
+/// `secret` is a keyword of a betterleaks rule; `secret_key` is another rule's
+/// only keyword. An automaton that reports just the shorter match hides the
+/// longer rule completely.
+#[test]
+fn rules_whose_keyword_extends_another_still_fire() {
+    let value = format!("sk_{}", tok(81, 29, alnum()));
+    let text = format!("'secret_key' => '{value}'");
+    let spans = configured(false, false, 2).scan(&text);
+    assert_eq!(spans.len(), 1, "spans: {spans:?}");
+    assert_eq!(spans[0].rule, "freemius-secret-key");
+}
+
+#[test]
+fn hex_and_percent_encoded_values_are_masked() {
+    let plain = format!("OPENAI_API_KEY=sk-proj-{}", tok(82, 24, alnum()));
+    for (label, encoded) in [("hex", hex_all(&plain)), ("percent", percent_all(&plain))] {
+        let text = format!("dump {encoded}\n");
+        let out = masked(&text);
+        assert_ne!(out, text, "{label} was not masked");
+        assert!(
+            !out.contains(&encoded[4..]),
+            "{label} run was masked in part"
+        );
+    }
+}
+
+/// The decoded bytes replace the encoded run in place, so the rule still sees
+/// the assignment name in front of the value.
+#[test]
+fn a_decoded_segment_is_matched_in_its_context() {
+    let plain = format!("OPENAI_API_KEY=sk-proj-{}", tok(83, 24, alnum()));
+    let text = format!("token {}\n", hex_all(&plain));
+    let spans = scanner().scan(&text);
+    assert_eq!(spans.len(), 1, "spans: {spans:?}");
+    assert_eq!(spans[0].rule, "hex");
+}
+
+#[test]
+fn decode_depth_is_a_parameter() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let mut layer = format!("OPENAI_API_KEY=sk-proj-{}", tok(84, 24, alnum()));
+    for _ in 0..3 {
+        layer = STANDARD.encode(layer.as_bytes());
+    }
+    let text = format!("payload {layer}\n");
+    assert!(
+        configured(true, true, 2).scan(&text).is_empty(),
+        "two rounds must not reach a third layer"
+    );
+    let deep = configured(true, true, 5).scan(&text);
+    assert_eq!(deep.len(), 1, "spans: {deep:?}");
+    assert_eq!(deep[0].rule, "base64");
+}
+
+/// base64 of ordinary prose and a detached private-key body are the two false
+/// refusals the keyword-free rule causes; both are off in this configuration.
+#[test]
+fn the_heuristic_rules_can_be_dropped() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let prose = STANDARD.encode(b"the loader reads a file and returns it");
+    assert!(
+        !scanner().scan(&prose).is_empty(),
+        "default masks base64 prose"
+    );
+    assert!(configured(false, false, 2).scan(&prose).is_empty());
+
+    let body = tok(85, 64, alnum());
+    assert!(
+        !scanner().scan(&body).is_empty(),
+        "default masks a bare blob"
+    );
+    assert!(configured(false, false, 2).scan(&body).is_empty());
+}
+
+#[test]
+fn a_checked_scanner_compiles_every_rule_up_front() {
+    assert!(Scanner::checked(Config::new(Vec::new())).is_ok());
+}
+
+#[test]
+fn scan_bytes_matches_scan() {
+    let text = format!("a ghp_{} b\n", tok(86, 36, alnum()));
+    let sc = scanner();
+    assert_eq!(sc.scan(&text), sc.scan_bytes(text.as_bytes()));
+}
+
+/// A service shares one scanner across its workers.
+#[test]
+fn a_scanner_can_be_shared_across_threads() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Scanner>();
 }

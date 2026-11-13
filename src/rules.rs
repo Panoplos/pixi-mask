@@ -4,6 +4,11 @@
 // Filters are reduced to an entropy floor plus allowlist regexes; provider
 // validation and token-ratio heuristics are not carried over.
 
+/// Pinned identity of the vendored config, readable by a program.
+pub const RULESET_NAME: &str = "betterleaks";
+pub const RULESET_VERSION: &str = "v2.0.0-rc.6";
+pub const RULESET_SHA256: &str = "7c305ade42d5dbad4650b97cca0299f9c16d152ec555ae47bd6f321f049f82e5";
+
 pub struct Allow {
     pub regex: &'static str,
     pub line: bool,

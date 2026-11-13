@@ -60,8 +60,10 @@ changes that matter for inline use:
   with no dots) add one. The 18 `*-client-id` rules go too: a public OAuth
   client id is not a secret, and masking it removes a constant the agent may
   need to read.
-- **A base64 pass** (depth 2), so an encoded blob is masked when its decoded
-  form trips a rule.
+- **Encoded segments.** base64, hex and percent runs are decoded and rescanned
+  with the decoded bytes substituted for the run, so a keyword rule still sees
+  `API_KEY=` in front of the value. The depth is the caller's, two rounds by
+  default, as in gitleaks' decoder.
 
 Measured on 49 realistic provider samples and 3.3 MB of a real repository:
 
@@ -107,7 +109,8 @@ keywords appear. That floor is why betterleaks costs the same on 2 KB as on
 47 KB, and it is the whole difference on files this small.
 
 Above roughly 50 KB the per-byte gap shows too: 35 ms of scanning on 108 KB
-against 10 ms here, about 3x. On a directory betterleaks still wins outright
+against 10 ms here, about 3x. The hex and percent passes add about 5% to these
+numbers. On a directory betterleaks still wins outright
 (3.3 MB over 401 files in 15 ms) because it fans out over cores, while pixi-mask
 is one process per file. That is the shape this tool is not built for: the hook
 runs it on one tool result at a time.
@@ -119,9 +122,15 @@ junk.
 ## Install
 
 ```bash
-cargo install --git https://github.com/Panoplos/pixi-mask
+cargo install --git https://github.com/Panoplos/pixi-mask --tag v0.2.0
 # or from a checkout:
 cargo build --release && ln -sf "$PWD/target/release/pixi-mask" ~/.local/bin/pixi-mask
+```
+
+As a dependency:
+
+```toml
+pixi-mask = { git = "https://github.com/Panoplos/pixi-mask", tag = "v0.2.0" }
 ```
 
 ## Usage
@@ -134,8 +143,11 @@ pixi-mask rules [--verify]   list rule ids; --verify compiles every rule
 Options
   --json                 machine-readable output (mask: {text, findings})
   -q, --quiet            no findings line on stderr
+  --decode-depth <n>     decode rounds over encoded runs (default 2, 0 disables)
+  --no-extra             vendored betterleaks rules only
+  --no-bare              drop the keyword-free 20-80 byte high-entropy rule
   --no-known             skip exact values from auth.json, .env, ...
-  --known-file <path>    add a file of known values (repeatable)
+  --known-file <path>    add a credential file to extract values from (repeatable)
   --known <value>        add one known value (repeatable)
 ```
 
@@ -152,6 +164,33 @@ before you decide to gate it:
 ```console
 $ git ls-files -z | xargs -0 cat | pixi-mask scan --json | jq '.findings | length'
 ```
+
+## Library
+
+`pixi-mask` is also a crate. A `Scanner` holds no global state: it builds every
+automaton from the static rule data and the known values you hand it, and the
+engine reads no environment variable and no file. Only the `known` module does,
+and only when you call it, so a service that passes an explicit list has no
+ambient inputs.
+
+```rust
+use pixi_mask::{Config, Scanner};
+
+let mut config = Config::new(Vec::new());
+config.extra = false;        // vendored betterleaks rules only
+config.bare_entropy = false; // no keyword-free heuristic
+config.depth = 5;            // decode rounds over encoded segments
+let scanner = Scanner::checked(config).expect("every rule compiles");
+for span in scanner.scan_bytes(&bytes) {
+    println!("{} {}..{}", span.rule, span.start, span.end);
+}
+```
+
+`Scanner::new` compiles rule regexes lazily and skips a rule that fails to
+compile; `Scanner::checked` compiles all of them up front and returns the
+failures, which is what an admission path wants. `pixi_mask::RULESET` carries
+the betterleaks version, the sha256 of the vendored config and the rule count,
+for a decision record.
 
 ## Wiring it into an agent
 
@@ -189,6 +228,8 @@ Beyond the vendored rules:
   themselves.
 - Any 20-80 byte run with mixed case, a digit and entropy >= 4.5, no keyword
   needed.
+- Encoded forms of all of the above: base64, hex and percent runs are decoded
+  (two rounds by default) and rescanned in the context they were found in.
 - Exact values from `~/.pi/agent/auth.json`, `~/.aws/credentials`,
   `~/.config/gh/hosts.yml`, `~/.npmrc`, `.env`, and `PIXI_MASK_KNOWN`
   (colon-separated paths), matched as literal substrings.
@@ -201,6 +242,15 @@ Beyond the vendored rules:
   (`NAME=<hex>`) are.
 - Bare runs longer than 80 bytes are skipped whole rather than masked in
   fragments, so inline base64 assets and npm `integrity` digests stay readable.
+- A decoded segment is rescanned only when it is at least 90% printable ASCII,
+  and only when the run is 8000 bytes or shorter; a scan stops decoding after
+  4096 segments.
+- Path-only rules are not carried. `pkcs12-file` is the only one, so a `.p12`
+  or `.pfx` has to be refused by name or by magic bytes in the caller. A text
+  scanner cannot see a path.
+- Rules compile lazily; a rule whose regex does not compile is skipped by
+  `scan` without a word. `pixi-mask rules --verify` and `Scanner::checked`
+  report it instead.
 - betterleaks' `tokenRatio` and `failsTokenEfficiency` heuristics are not
   ported, so the ~149 rules that use them mask a little more than betterleaks
   would: natural-language values that pass the entropy floor are still masked.
@@ -223,6 +273,16 @@ python3 tools/gen-rules.py          # regenerate
 python3 tools/gen-rules.py --check  # fail if src/rules.rs is stale
 ```
 
+`rules --json` prints the vendored config's identity next to the ids, so a
+decision record can name what scanned:
+
+```json
+{"ruleset": {"name": "betterleaks", "version": "v2.0.0-rc.6",
+             "sha256": "7c305ade42d5dbad4650b97cca0299f9c16d152ec555ae47bd6f321f049f82e5",
+             "rules": 452, "extra": 10},
+ "rules": ["1password-secret-key", "..."]}
+```
+
 452 of its 474 rules survive the translation. Dropped: `pkcs12-file` (a path
 rule with no pattern to match), the three generic rules (replaced in
 `src/extra.rs`) and the 18 `*-client-id` rules. Each rule's Expr filter is reduced to its entropy floor
@@ -241,7 +301,7 @@ Updating the ruleset: drop in a fresh `betterleaks.toml`, regenerate, run
 ```bash
 cargo build --release
 cargo test --release        # shapes, benign content, boundaries, CLI
-python3 tools/gen-rules.py --check
+python3 tools/gen-rules.py --check   # also regenerates the ruleset identity
 cargo clippy --release --all-targets
 ```
 

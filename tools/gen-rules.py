@@ -23,6 +23,7 @@ Usage: python3 tools/gen-rules.py [--check]
   --check  exit 1 if src/rules.rs is stale instead of rewriting it
 """
 
+import hashlib
 import re
 import subprocess
 import sys
@@ -30,6 +31,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / "rules" / "betterleaks.toml"
+# Release the vendored config was copied from; shown by `pixi-mask rules --json`.
+RULESET_VERSION = "v2.0.0-rc.6"
 OUT = ROOT / "src" / "rules.rs"
 
 # The three generic rules match `NAME=<value>` with no notion of what the value
@@ -252,6 +255,10 @@ def main():
     out.append("// Path-only rules are dropped: this scanner sees text, not paths.\n")
     out.append("// Filters are reduced to an entropy floor plus allowlist regexes; provider\n")
     out.append("// validation and token-ratio heuristics are not carried over.\n\n")
+    out.append("/// Pinned identity of the vendored config, readable by a program.\n")
+    out.append('pub const RULESET_NAME: &str = "betterleaks";\n')
+    out.append('pub const RULESET_VERSION: &str = "%s";\n' % RULESET_VERSION)
+    out.append('pub const RULESET_SHA256: &str = "%s";\n\n' % hashlib.sha256(CONFIG.read_bytes()).hexdigest())
     out.append("pub struct Allow {\n    pub regex: &'static str,\n    pub line: bool,\n}\n\n")
     out.append("pub struct Rule {\n")
     out.append("    pub id: &'static str,\n")
